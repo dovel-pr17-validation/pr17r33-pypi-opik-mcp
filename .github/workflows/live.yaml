@@ -124,7 +124,7 @@ jobs:
 
       - name: Generate _version.py (required before any uv build)
         run: make version
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
       - name: Install Python
         run: uv python install 3.13
       - name: Install dependencies
@@ -199,7 +199,7 @@ jobs:
       - name: Generate _version.py (required before any uv build)
         if: steps.configured.outputs.ok == 'true'
         run: make version
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
         if: steps.configured.outputs.ok == 'true'
       - name: Install Python
         if: steps.configured.outputs.ok == 'true'
