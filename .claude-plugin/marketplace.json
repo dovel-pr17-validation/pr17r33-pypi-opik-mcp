@@ -1,0 +1,17 @@
+{
+  "name": "opik",
+  "owner": {
+    "name": "Comet ML",
+    "url": "https://github.com/comet-ml"
+  },
+  "metadata": {
+    "description": "The opik plugin: the Opik agent skills and the hosted Opik MCP server."
+  },
+  "plugins": [
+    {
+      "name": "opik",
+      "source": "./plugins/opik",
+      "description": "Opik agent skills and the hosted Opik MCP server: instrument, trace, evaluate and debug LLM applications with Opik."
+    }
+  ]
+}

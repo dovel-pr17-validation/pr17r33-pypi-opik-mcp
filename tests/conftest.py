@@ -1,0 +1,190 @@
+import os
+from collections.abc import AsyncIterator, Generator
+
+import httpx
+import pytest
+from asgi_lifespan import LifespanManager
+from httpx import ASGITransport
+
+# Analytics is disabled by default for the whole test process. Tests that
+# exercise analytics opt in explicitly (monkeypatch / respx mocks); leaving it
+# on would let the process-wide singleton spawn a daemon worker that phones
+# home to stats.comet.com over the real network. Beyond being slow and flaky,
+# an in-flight POST from one test can land in a *later* test's ``@respx.mock``
+# window and corrupt ``route.calls.last`` assertions. ``setdefault`` so an
+# explicit override in the environment still wins.
+os.environ.setdefault("OPIK_MCP_ANALYTICS_ENABLED", "false")
+
+# Sentry, the other telemetry channel, likewise. ``error_tracking.setup_sentry``
+# already refuses to initialise under pytest, but that guard reads
+# ``sys.modules`` and ``PYTEST_CURRENT_TEST`` — neither of which survives into a
+# subprocess started with a CLEAN env, which is exactly how
+# ``analytics/test_subprocess.py`` starts one. Setting the flag here puts the
+# opt-out in the environment itself, so anything that inherits os.environ
+# (``tests/hermetic``) carries it, and the guard becomes the backstop rather than the
+# only defence. A crash in a test must never reach the real Sentry project.
+os.environ.setdefault("OPIK_MCP_SENTRY_ENABLED", "false")
+
+# A developer's own AI Spend workspace would switch the AI Spend feature on
+# for the whole suite; tests that want it build their settings for it.
+for _workspace_var in ("OPIK_WORKSPACE", "COMET_WORKSPACE"):
+    if os.environ.get(_workspace_var, "").startswith("__ai_spend_"):
+        del os.environ[_workspace_var]
+
+
+@pytest.fixture(autouse=True)
+def _reset_analytics_wrappers_state() -> Generator[None]:
+    """Reset every process-wide analytics flag between tests.
+
+    Each test file used to reset only the globals it touched, leaving a
+    cross-file pollution foot-gun: a new test that calls (e.g.)
+    ``_maybe_emit_tools_listed`` without its own autouse fixture would
+    inherit ``_tools_listed_fired_processwide=True`` from a previous file
+    and silently no-op. Centralising the reset here keeps every test
+    independent regardless of which globals it ends up touching.
+
+    Also drops the process-wide ``get_analytics()`` singleton between tests so
+    its emit worker (a daemon thread posting over httpx) never survives a test
+    boundary. Analytics is disabled by default for the whole test process (see
+    the ``OPIK_MCP_ANALYTICS_ENABLED`` default set at the top of this module),
+    so the singleton built here never spawns a worker or phones home — but a
+    test that explicitly enables analytics still gets a clean singleton each
+    time rather than inheriting another test's live worker, whose in-flight
+    POST could otherwise land in a *later* test's ``@respx.mock`` window and
+    break assertions keyed on ``route.calls.last``.
+    """
+    from opik_mcp.analytics import reset_analytics_for_tests, transport_probe
+    from opik_mcp.analytics.boot_props import LIFECYCLE_SENTINEL
+    from opik_mcp.analytics.environment import _reset_detector_caches_for_tests
+    from opik_mcp.analytics.wrappers import (
+        _reset_seen_sessions_for_tests,
+        _reset_seen_tools_listed_for_tests,
+    )
+    from opik_mcp.identity.store import reset_identities_for_tests
+    from opik_mcp.read_list.project_scope import reset_project_cache_for_tests
+
+    _reset_process_caches()
+    reset_analytics_for_tests()
+    _reset_seen_sessions_for_tests()
+    _reset_seen_tools_listed_for_tests()
+    transport_probe.reset_for_tests()
+    reset_identities_for_tests()
+    _reset_detector_caches_for_tests()
+    # The project-name → id cache is process-wide and keyed by client config;
+    # test fakes carry no config, so without a reset one test's resolution
+    # would satisfy the next test's lookup.
+    reset_project_cache_for_tests()
+    # main() sets this sentinel so the build_app() lifespan skips its own emit.
+    # Clear it between tests or a test that calls main() leaves the build_app()
+    # lifespan (e.g. the session http_client fixture) permanently muted.
+    os.environ.pop(LIFECYCLE_SENTINEL, None)
+    yield
+    reset_analytics_for_tests()
+    _reset_seen_sessions_for_tests()
+    _reset_seen_tools_listed_for_tests()
+    transport_probe.reset_for_tests()
+    reset_identities_for_tests()
+    reset_project_cache_for_tests()
+    os.environ.pop(LIFECYCLE_SENTINEL, None)
+    _reset_process_caches()
+
+
+def _reset_process_caches() -> None:
+    """Clear the module-level caches that would otherwise carry one test's
+    environment into the next: settings read from env, the install id read
+    from HOME, the per-session host context, and the account identity (its
+    disk read, in-flight refreshes and bookkeeping)."""
+    from opik_mcp import config
+    from opik_mcp.analytics import identity
+    from opik_mcp.analytics.mcp_client_info import _reset_call_context_cache_for_tests
+    from opik_mcp.identity.account import reset_account_identity_for_tests
+
+    config.get_settings.cache_clear()
+    identity._get_install_id.cache_clear()
+    _reset_call_context_cache_for_tests()
+    reset_account_identity_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _disable_workspace_introspection() -> Generator[None]:
+    """Stub OAuth workspace introspection to a no-op by default.
+
+    The ``initialize`` handshake resolves the caller's identity by POSTing to
+    opik-backend's ``/opik/auth-oauth`` (``server.introspect_oauth_token``).
+    Left live, every test that sends a session-less OAuth bearer to ``/mcp`` would
+    fire a real network call — slow, flaky, and able to land in another test's
+    ``@respx.mock`` window. Stubbed to ``unknown`` by default — the fail-open
+    outcome, so the request is forwarded exactly as with no introspection at
+    all (mirrors the analytics default above); tests that exercise validation
+    ``monkeypatch.setattr`` the real function back, and the ``identity.oauth``
+    unit tests call it directly.
+
+    Uses a standalone ``pytest.MonkeyPatch()`` rather than the ``monkeypatch``
+    *fixture* on purpose: depending on that fixture from an autouse fixture pulls
+    it into the autouse setup phase ahead of ``_reset_analytics_wrappers_state``,
+    inverting teardown order so its ``reset_analytics_for_tests()`` runs while a
+    test still has ``get_analytics`` patched to a non-lru_cache stub (AttributeError
+    on ``cache_info``). A self-owned instance keeps fixture ordering untouched.
+    """
+
+    from opik_mcp.identity.oauth import Introspection
+
+    async def _unknown(*_args: object, **_kwargs: object) -> Introspection:
+        return Introspection(status="unknown")
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr("opik_mcp.server.http.middleware.introspect_oauth_token", _unknown)
+    try:
+        yield
+    finally:
+        mp.undo()
+
+
+@pytest.fixture(autouse=True)
+def _disable_api_key_identity() -> Generator[None]:
+    """Stub API-key identity resolution to a no-op by default.
+
+    ``_build_event`` resolves the install's own identity from Comet's
+    account-details endpoint unless it is local. Left live, any test that
+    builds an event with an ``opik_api_key`` set would spawn a background
+    refresh thread pointed at www.comet.com — a real network call escaping into
+    whatever ``@respx.mock`` window happened to be open, from a thread whose
+    failure is swallowed by design and therefore invisible.
+
+    Disabled by default (mirrors the OAuth introspection stub above). The
+    ``resolve_api_key_identity`` tests call the real function directly, and a
+    test wanting resolution inside an event patches this back.
+
+    Uses a self-owned ``MonkeyPatch`` for the same fixture-ordering reason
+    documented on ``_disable_workspace_introspection``.
+    """
+
+    def _none(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr("opik_mcp.identity.caller.resolve_api_key_identity", _none)
+    try:
+        yield
+    finally:
+        mp.undo()
+
+
+# Session-scoped HTTP client over the real ASGI app. Shared across test
+# modules because the underlying FastMCP `StreamableHTTPSessionManager` is a
+# process-level singleton that may only be `.run()`'d once — letting each
+# module build its own app raises RuntimeError on the second module.
+@pytest.fixture(scope="session")
+def anyio_backend() -> str:
+    return "asyncio"
+
+
+@pytest.fixture(scope="session")
+async def http_client() -> AsyncIterator[httpx.AsyncClient]:
+    from opik_mcp.server import build_app
+
+    app = build_app()
+    async with LifespanManager(app):
+        transport = ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://localhost:8080") as c:
+            yield c

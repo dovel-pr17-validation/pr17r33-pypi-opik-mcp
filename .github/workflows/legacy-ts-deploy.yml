@@ -1,0 +1,67 @@
+name: Publish Release (Legacy TS)
+
+on:
+  # Manual-only. The TypeScript source left main in OPIK-8489; it lives at the
+  # tag legacy-typescript-final. To publish: branch off that tag, tag the
+  # branch npm-v<version>, and dispatch this workflow from that tag ref. This
+  # file stays on main so the dispatch exists; delete it after 2026-11-15.
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: legacy/typescript
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          cache: 'npm'
+          cache-dependency-path: legacy/typescript/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run linting
+        run: npm run lint
+
+      - name: Run tests
+        run: npm run test
+
+      - name: Build project
+        run: npm run build
+
+      - name: Require an npm-v tag
+        run: |
+          if [[ "${GITHUB_REF}" != refs/tags/npm-v* ]]; then
+            echo "This workflow must be triggered from a tag that starts with npm-v"
+            exit 1
+          fi
+
+      # No MCP Registry publish here. release.yaml publishes
+      # io.github.comet-ml/opik-mcp from the Python release, and a 2.x version
+      # from this workflow would add another npm version to that entry. A
+      # dispatch runs the workflow file at the tag it is dispatched from, so a
+      # release branch off legacy-typescript-final must delete its registry
+      # steps as well.
+      - name: Publish to NPM
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF#refs/tags/npm-v}"
+          if npm view opik-mcp@"$VERSION" version >/dev/null 2>&1; then
+            echo "opik-mcp@$VERSION already exists on npm, skipping publish."
+          else
+            # Trusted Publishing via GitHub OIDC (id-token: write) - no npm token needed.
+            npm publish --provenance --access public
+          fi
