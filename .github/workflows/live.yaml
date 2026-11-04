@@ -150,7 +150,7 @@ jobs:
           for c in $(docker ps -a --format '{{.Names}}' | grep -E 'backend'); do
             docker logs "$c" > "${RUNNER_TEMP}/logs/$c.log" 2>&1 || true
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: opik-backend-logs
